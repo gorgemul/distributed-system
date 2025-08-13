@@ -22,10 +22,14 @@ const (
 type Coordinator struct {
 	// Your definitions here.
 	nReduce                 int
-	jobLock                 sync.Mutex
+
 	quit                    bool
+	quitLock                sync.Mutex
+
 	intermediateLocks       []sync.Mutex
 	intermediate            []map[string][]string
+
+	jobLock                 sync.Mutex
 	mapperJobs              map[string]jobStatus
 	mapperJobsSuccessCount  int
 	reducerJobs             map[int]jobStatus
@@ -108,7 +112,9 @@ func (c *Coordinator) PutReducerJob(args *PutReducerJobArgs, _ *RpcPlaceholder) 
 		c.reducerJobs[args.ReducerIndex] = Success
 		c.reducerJobsSuccessCount++
 		if c.reducerJobsSuccessCount == len(c.reducerJobs) {
+			c.quitLock.Lock()
 			c.quit = true
+			c.quitLock.Unlock()
 		}
 	} else {
 		c.reducerJobs[args.ReducerIndex] = Ready
@@ -133,7 +139,10 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	return c.quit
+	c.quitLock.Lock()
+	q := c.quit
+	c.quitLock.Unlock()
+	return q
 }
 
 // create a Coordinator.
