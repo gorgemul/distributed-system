@@ -23,7 +23,34 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type RpcPlaceholder struct {
+}
 
+type GetMapperJobReply struct {
+	File    string
+	NReduce int
+	Quit    bool
+}
+
+type MapperEmitArgs struct {
+	ReducerIndex int
+	Key          string
+	Values       []string
+}
+
+type PutMapperJobArgs struct {
+	File    string
+	Success bool
+}
+
+type GetReducerJobReply struct {
+	ReducerIndex int
+}
+
+type PutReducerJobArgs struct {
+	ReducerIndex int
+	Success      bool
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
