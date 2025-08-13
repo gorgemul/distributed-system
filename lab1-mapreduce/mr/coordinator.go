@@ -1,13 +1,15 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
-import "sync"
-import "fmt"
-import "encoding/json"
+import (
+	"log"
+	"net"
+	"os"
+	"net/rpc"
+	"net/http"
+	"sync"
+	"fmt"
+	"encoding/json"
+)
 
 type jobStatus int
 

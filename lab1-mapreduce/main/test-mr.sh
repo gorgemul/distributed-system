@@ -7,7 +7,7 @@ set -xe
 #
 
 # un-comment this to run the tests with the Go race detector.
-# RACE=-race
+RACE=-race
 
 if [[ "$OSTYPE" = "darwin"* ]]
 then
@@ -62,17 +62,21 @@ rm -f mr-*
 # make sure software is freshly built.
 (cd ../../mrapps && go clean)
 (cd .. && go clean)
-(cd ../../mrapps && go build $RACE -buildmode=plugin wc.go) || exit 1
-(cd ../../mrapps && go build $RACE -buildmode=plugin indexer.go) || exit 1
-(cd ../../mrapps && go build $RACE -buildmode=plugin mtiming.go) || exit 1
-(cd ../../mrapps && go build $RACE -buildmode=plugin rtiming.go) || exit 1
-(cd ../../mrapps && go build $RACE -buildmode=plugin jobcount.go) || exit 1
-(cd ../../mrapps && go build $RACE -buildmode=plugin early_exit.go) || exit 1
-(cd ../../mrapps && go build $RACE -buildmode=plugin crash.go) || exit 1
-(cd ../../mrapps && go build $RACE -buildmode=plugin nocrash.go) || exit 1
-(cd .. && go build $RACE mrcoordinator.go) || exit 1
-(cd .. && go build $RACE mrworker.go) || exit 1
-(cd .. && go build $RACE mrsequential.go) || exit 1
+# speed up test
+(
+    (cd ../../mrapps && go build $RACE -buildmode=plugin wc.go) &
+    (cd ../../mrapps && go build $RACE -buildmode=plugin indexer.go) &
+    (cd ../../mrapps && go build $RACE -buildmode=plugin mtiming.go) &
+    (cd ../../mrapps && go build $RACE -buildmode=plugin rtiming.go) &
+    (cd ../../mrapps && go build $RACE -buildmode=plugin jobcount.go) &
+    (cd ../../mrapps && go build $RACE -buildmode=plugin early_exit.go) &
+    (cd ../../mrapps && go build $RACE -buildmode=plugin crash.go) &
+    (cd ../../mrapps && go build $RACE -buildmode=plugin nocrash.go) &
+    (cd .. && go build $RACE mrcoordinator.go) &
+    (cd .. && go build $RACE mrworker.go) &
+    (cd .. && go build $RACE mrsequential.go) &
+    wait
+)
 
 failed_any=0
 

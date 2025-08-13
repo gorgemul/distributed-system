@@ -5,103 +5,29 @@ import (
 	"log"
 	"net/rpc"
 	"hash/fnv"
-	"time"
-	"os"
-	"slices"
-	"strings"
-	"encoding/json"
-	"maps"
 )
 
-// Map functions return a slice of KeyValue.
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-// main/mrworker.go calls this function.
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-	// Your worker implementation here.
-	for {
-		reply := getMapperJob()
-		if reply.Quit {
-			break
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	for r := getMapperJob(); !r.done(); r = getMapperJob() {
+		if !r.wait() {
+			r.run(mapf)
 		}
-		if reply.File == "" {
-			time.Sleep(1 * time.Second)
-			continue
-		}
-		timeout := time.NewTimer(10 * time.Second)
-		go func() {
-			<-timeout.C
-			putMapperJob(PutMapperJobArgs{File: reply.File, Success: false})
-		}()
-		data, err := os.ReadFile(reply.File)
-		if err != nil {
-			panic(err)
-		}
-		intermediate := mapf(reply.File, string(data))
-		slices.SortFunc(intermediate, func(a, b KeyValue) int {
-			return strings.Compare(a.Key, b.Key)
-		})
-		i := 0
-		for i < len(intermediate) {
-			k := i + 1
-			for k < len(intermediate) && intermediate[k].Key == intermediate[i].Key {
-				k++
-			}
-			values := []string{}
-			for j := i; j < k; j++ {
-				values = append(values, intermediate[j].Value)
-			}
-			mapperEmit(MapperEmitArgs{ihash(intermediate[i].Key) % reply.NReduce, intermediate[i].Key, values})
-			i = k
-		}
-		timeout.Stop()
-		putMapperJob(PutMapperJobArgs{File: reply.File, Success: true})
 	}
-	for {
-		reply, ok := getReducerJob()
-		if !ok {
-			break
+	for r, ok := getReducerJob(); ok; r, ok = getReducerJob() {
+		if !r.wait() {
+			r.run(reducef)
 		}
-		if reply.ReducerIndex == -1 {
-			time.Sleep(1 * time.Second)
-			continue
-		}
-		timeout := time.NewTimer(10 * time.Second)
-		go func() {
-			<-timeout.C
-			putReducerJob(PutReducerJobArgs{ReducerIndex: reply.ReducerIndex, Success: false})
-		}()
-		data, err := os.ReadFile(fmt.Sprintf("mr-intermediate-%d.json", reply.ReducerIndex))
-		if err != nil {
-			panic(err)
-		}
-		var m map[string][]string
-		if err := json.Unmarshal(data, &m); err != nil {
-			panic(err)
-		}
-		output, err := os.Create(fmt.Sprintf("mr-out-%d", reply.ReducerIndex))
-		if err != nil {
-			panic(err)
-		}
-		sortedKeys := slices.Sorted(maps.Keys(m))
-		for _, key := range sortedKeys {
-			fmt.Fprintf(output, "%v %v\n", key, reducef(key, m[key]))
-		}
-		timeout.Stop()
-		output.Close()
-		putReducerJob(PutReducerJobArgs{ReducerIndex: reply.ReducerIndex, Success: true})
 	}
 }
 
@@ -131,7 +57,8 @@ func putMapperJob(args PutMapperJobArgs) {
 func getReducerJob() (reply GetReducerJobReply, ok bool) {
 	args := RpcPlaceholder{}
 	reply = GetReducerJobReply{}
-	if ok = call("Coordinator.GetReducerJob", &args, &reply); !ok { // not ok means that coordinator has quit, indicating that all reducer jobs has finished, so reducer can quit
+	// not ok means that coordinator has quit, indicating that all reducer jobs has finished, so reducer can quit
+	if ok = call("Coordinator.GetReducerJob", &args, &reply); !ok {
 		return
 	}
 	return
