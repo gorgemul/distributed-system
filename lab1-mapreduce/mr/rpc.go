@@ -9,9 +9,18 @@ import (
 	"fmt"
 	"encoding/json"
 	"maps"
+	// "log"
 )
 
 type RpcPlaceholder struct {
+}
+
+type KeepAliveArgs struct {
+	WorkerId int
+}
+
+type GetMapperJobArgs struct {
+	WorkerId int
 }
 
 type GetMapperJobReply struct {
@@ -27,8 +36,13 @@ type MapperEmitArgs struct {
 }
 
 type PutMapperJobArgs struct {
+	WorkerId int
 	File    string
 	Success bool
+}
+
+type GetReducerJobArgs struct {
+	WorkerId int
 }
 
 type GetReducerJobReply struct {
@@ -36,6 +50,7 @@ type GetReducerJobReply struct {
 }
 
 type PutReducerJobArgs struct {
+	WorkerId     int
 	ReducerIndex int
 	Success      bool
 }
@@ -57,8 +72,9 @@ func (r GetMapperJobReply) run(mapf func(string, string) []KeyValue) {
 	defer timeout.Stop()
 	go func() {
 		<-timeout.C
-		putMapperJob(PutMapperJobArgs{File: r.File, Success: false})
+		putMapperJob(PutMapperJobArgs{WorkerId: WorkerId, File: r.File, Success: false})
 	}()
+	// log.Printf("[CLIENT] get file: %v", r.File)
 	data, err := os.ReadFile(r.File)
 	if err != nil {
 		panic(err)
@@ -77,7 +93,7 @@ func (r GetMapperJobReply) run(mapf func(string, string) []KeyValue) {
 		mapperEmit(MapperEmitArgs{ihash(key) % r.NReduce, key, values})
 		i = j
 	}
-	putMapperJob(PutMapperJobArgs{File: r.File, Success: true})
+	putMapperJob(PutMapperJobArgs{WorkerId: WorkerId, File: r.File, Success: true})
 }
 
 func (r GetReducerJobReply) wait() bool {
@@ -93,7 +109,7 @@ func (r GetReducerJobReply) run(reducef func(string, []string) string) {
 	defer timeout.Stop()
 	go func() {
 		<-timeout.C
-		putReducerJob(PutReducerJobArgs{ReducerIndex: r.ReducerIndex, Success: false})
+		putReducerJob(PutReducerJobArgs{WorkerId: WorkerId, ReducerIndex: r.ReducerIndex, Success: false})
 	}()
 	output, err := os.Create(fmt.Sprintf("mr-out-%d", r.ReducerIndex))
 	if err != nil {
@@ -112,7 +128,7 @@ func (r GetReducerJobReply) run(reducef func(string, []string) string) {
 	for _, key := range sortedKeys {
 		fmt.Fprintf(output, "%v %v\n", key, reducef(key, m[key]))
 	}
-	putReducerJob(PutReducerJobArgs{ReducerIndex: r.ReducerIndex, Success: true})
+	putReducerJob(PutReducerJobArgs{WorkerId: WorkerId, ReducerIndex: r.ReducerIndex, Success: true})
 }
 
 func coordinatorSock() string {

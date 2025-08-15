@@ -9,16 +9,17 @@ import (
 	"sync"
 	"fmt"
 	"encoding/json"
+	"time"
 )
 
 type jobStatus int
-
-const (
-	Ready jobStatus = iota
-	Exec
-	Success
-)
-
+type workerType int
+type workerStatus struct {
+	kind workerType
+	mapperJobKey string
+	reducerJobKey int
+	pingTime time.Time
+}
 type Coordinator struct {
 	// Your definitions here.
 	nReduce                 int
@@ -34,10 +35,23 @@ type Coordinator struct {
 	mapperJobsSuccessCount  int
 	reducerJobs             map[int]jobStatus
 	reducerJobsSuccessCount int
+
+	workerTrackerLock       sync.Mutex
+	workerTracker           map[int]workerStatus
 }
 
-// Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) GetMapperJob(_ *RpcPlaceholder, reply *GetMapperJobReply) error {
+const (
+	Ready jobStatus = iota
+	Exec
+	Success
+)
+
+const (
+	Mapper workerType = iota
+	Reducer
+)
+
+func (c *Coordinator) GetMapperJob(args *GetMapperJobArgs, reply *GetMapperJobReply) error {
 	c.jobLock.Lock()
 	defer c.jobLock.Unlock()
 	if c.mapperJobsSuccessCount == len(c.mapperJobs) {
@@ -46,6 +60,9 @@ func (c *Coordinator) GetMapperJob(_ *RpcPlaceholder, reply *GetMapperJobReply) 
 	}
 	for file, status := range c.mapperJobs {
 		if status == Ready { 
+			c.workerTrackerLock.Lock()
+			c.workerTracker[args.WorkerId] = workerStatus{kind: Mapper, mapperJobKey: file, pingTime: time.Now()}
+			c.workerTrackerLock.Unlock()
 			c.mapperJobs[file] = Exec
 			reply.File = file
 			reply.NReduce = c.nReduce
@@ -55,6 +72,7 @@ func (c *Coordinator) GetMapperJob(_ *RpcPlaceholder, reply *GetMapperJobReply) 
 	return nil
 }
 
+// TODO: handle partially emit
 func (c *Coordinator) MapperEmit(args *MapperEmitArgs, _ *RpcPlaceholder) error {
 	c.intermediateLocks[args.ReducerIndex].Lock()
 	defer c.intermediateLocks[args.ReducerIndex].Unlock()
@@ -69,6 +87,7 @@ func (c *Coordinator) PutMapperJob(args *PutMapperJobArgs, _ *RpcPlaceholder) er
 		c.mapperJobs[args.File] = Success
 		c.mapperJobsSuccessCount++
 		if c.mapperJobsSuccessCount == len(c.mapperJobs) {
+			//TODO: should have a [WorkerId][ReducerIndex]{k, values}, and aggregate it to c.intermediate[i]
 			for i := range c.nReduce {
 				f, err := os.Create(fmt.Sprintf("mr-intermediate-%d.json", i))
 				if err != nil {
@@ -85,10 +104,14 @@ func (c *Coordinator) PutMapperJob(args *PutMapperJobArgs, _ *RpcPlaceholder) er
 	} else {
 		c.mapperJobs[args.File] = Ready
 	}
+	c.workerTrackerLock.Lock()
+	// log.Printf("[SERVER]: mapper remove worker %d from tracker", args.WorkerId)
+	delete(c.workerTracker, args.WorkerId)
+	c.workerTrackerLock.Unlock()
 	return nil
 }
 
-func (c *Coordinator) GetReducerJob(_ *RpcPlaceholder, reply *GetReducerJobReply) error {
+func (c *Coordinator) GetReducerJob(args *GetReducerJobArgs, reply *GetReducerJobReply) error {
 	c.jobLock.Lock()
 	defer c.jobLock.Unlock()
 	reply.ReducerIndex = -1 // to indicate that no reducer job but not quit yet, since zero value of int is 0, can't distinguish index 0 and zero value
@@ -97,6 +120,10 @@ func (c *Coordinator) GetReducerJob(_ *RpcPlaceholder, reply *GetReducerJobReply
 	}
 	for i, status := range c.reducerJobs {
 		if status == Ready {
+			c.workerTrackerLock.Lock()
+			// log.Printf("assign reducer %d to worker %d", i, args.WorkerId)
+			c.workerTracker[args.WorkerId] = workerStatus{kind: Reducer, reducerJobKey: i, pingTime: time.Now()}
+			c.workerTrackerLock.Unlock()
 			c.reducerJobs[i] = Exec
 			reply.ReducerIndex = i
 			break
@@ -119,7 +146,51 @@ func (c *Coordinator) PutReducerJob(args *PutReducerJobArgs, _ *RpcPlaceholder) 
 	} else {
 		c.reducerJobs[args.ReducerIndex] = Ready
 	}
+	c.workerTrackerLock.Lock()
+	// log.Printf("[SERVER]: reducer remove worker %d from tracker", args.WorkerId)
+	delete(c.workerTracker, args.WorkerId)
+	c.workerTrackerLock.Unlock()
 	return nil
+}
+
+func (c *Coordinator) KeepAlive(args *KeepAliveArgs, _ *RpcPlaceholder) error {
+	c.workerTrackerLock.Lock()
+	defer c.workerTrackerLock.Unlock()
+	ws, ok := c.workerTracker[args.WorkerId]
+	// log.Printf("[SERVER] receive client %d ping", args.WorkerId)
+	// indicating that worker hasn't getting any job yet
+	if !ok { 
+		// log.Printf("[SERVER] client %d not has job yet", args.WorkerId)
+		return nil
+	}
+	ws.pingTime = time.Now()
+	c.workerTracker[args.WorkerId] = ws
+	return nil
+}
+
+func (c *Coordinator) trackWorkers() {
+	ticker := time.NewTicker(3 * time.Second)
+	go func() {
+		for {
+			<-ticker.C
+			c.workerTrackerLock.Lock()
+			for id, status := range c.workerTracker {
+				if time.Since(status.pingTime).Seconds() >= 3 {
+					c.jobLock.Lock()
+					switch status.kind {
+					case Mapper:
+						c.mapperJobs[status.mapperJobKey] = Ready
+					case Reducer:
+						c.reducerJobs[status.reducerJobKey] = Ready
+					}
+					c.jobLock.Unlock()
+					// log.Printf("worker %v is being deleted", id)
+					delete(c.workerTracker, id)
+				}
+			}
+			c.workerTrackerLock.Unlock()
+		}
+	}()
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -168,6 +239,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.reducerJobs = reducerJobs
 	c.intermediateLocks = make([]sync.Mutex, nReduce)
 	c.intermediate = intermediate
+	c.workerTracker = make(map[int]workerStatus)
 	c.server()
+	c.trackWorkers()
 	return &c
 }

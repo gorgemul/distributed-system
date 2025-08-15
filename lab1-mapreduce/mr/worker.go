@@ -5,7 +5,11 @@ import (
 	"log"
 	"net/rpc"
 	"hash/fnv"
+	"os"
+	"time"
 )
+
+var WorkerId int = os.Getpid()
 
 type KeyValue struct {
 	Key   string
@@ -19,6 +23,7 @@ func ihash(key string) int {
 }
 
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	keepAlive()
 	for r := getMapperJob(); !r.done(); r = getMapperJob() {
 		if !r.wait() {
 			r.run(mapf)
@@ -31,8 +36,27 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 	}
 }
 
+func keepAlive() {
+	ticker := time.NewTicker(1 * time.Second)
+	go func() {
+		for {
+			<-ticker.C
+			// log.Printf("[CLIENT] worker %d ping server", WorkerId)
+			ping()
+		}
+	}()
+}
+
+func ping() {
+	args := KeepAliveArgs{WorkerId}
+	reply := RpcPlaceholder{}
+	if ok := call("Coordinator.KeepAlive", &args, &reply); !ok {
+		log.Fatal("getMapperJob call fail")
+	}
+}
+
 func getMapperJob() GetMapperJobReply {
-	args := RpcPlaceholder{}
+	args := GetMapperJobArgs{WorkerId}
 	reply := GetMapperJobReply{}
 	if ok := call("Coordinator.GetMapperJob", &args, &reply); !ok {
 		log.Fatal("getMapperJob call fail")
@@ -55,7 +79,7 @@ func putMapperJob(args PutMapperJobArgs) {
 }
 
 func getReducerJob() (reply GetReducerJobReply, ok bool) {
-	args := RpcPlaceholder{}
+	args := GetReducerJobArgs{WorkerId}
 	reply = GetReducerJobReply{}
 	// not ok means that coordinator has quit, indicating that all reducer jobs has finished, so reducer can quit
 	if ok = call("Coordinator.GetReducerJob", &args, &reply); !ok {
