@@ -1,15 +1,14 @@
 package mr
 
 import (
-	"os"
-	"strconv"
-	"time"
-	"slices"
-	"strings"
-	"fmt"
 	"encoding/json"
+	"fmt"
 	"maps"
-	// "log"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
 )
 
 type RpcPlaceholder struct {
@@ -30,6 +29,7 @@ type GetMapperJobReply struct {
 }
 
 type MapperEmitArgs struct {
+	WorkerId     int
 	ReducerIndex int
 	Key          string
 	Values       []string
@@ -37,8 +37,8 @@ type MapperEmitArgs struct {
 
 type PutMapperJobArgs struct {
 	WorkerId int
-	File    string
-	Success bool
+	File     string
+	Success  bool
 }
 
 type GetReducerJobArgs struct {
@@ -68,13 +68,6 @@ func (r GetMapperJobReply) done() bool {
 }
 
 func (r GetMapperJobReply) run(mapf func(string, string) []KeyValue) {
-	timeout := time.NewTimer(10 * time.Second)
-	defer timeout.Stop()
-	go func() {
-		<-timeout.C
-		putMapperJob(PutMapperJobArgs{WorkerId: WorkerId, File: r.File, Success: false})
-	}()
-	// log.Printf("[CLIENT] get file: %v", r.File)
 	data, err := os.ReadFile(r.File)
 	if err != nil {
 		panic(err)
@@ -83,15 +76,22 @@ func (r GetMapperJobReply) run(mapf func(string, string) []KeyValue) {
 	slices.SortFunc(intermediate, func(a, b KeyValue) int {
 		return strings.Compare(a.Key, b.Key)
 	})
+	timeout := time.NewTimer(10 * time.Second)
 	for i := 0; i < len(intermediate); {
-		key, j := intermediate[i].Key, i
-		values := []string{}
-		for j < len(intermediate) && intermediate[j].Key == key {
-			values = append(values, intermediate[j].Value)
-			j++
+		select {
+		case <-timeout.C:
+			putMapperJob(PutMapperJobArgs{WorkerId: WorkerId, File: r.File, Success: false})
+			return
+		default:
+			key, j := intermediate[i].Key, i
+			values := []string{}
+			for j < len(intermediate) && intermediate[j].Key == key {
+				values = append(values, intermediate[j].Value)
+				j++
+			}
+			mapperEmit(MapperEmitArgs{WorkerId, ihash(key) % r.NReduce, key, values})
+			i = j
 		}
-		mapperEmit(MapperEmitArgs{ihash(key) % r.NReduce, key, values})
-		i = j
 	}
 	putMapperJob(PutMapperJobArgs{WorkerId: WorkerId, File: r.File, Success: true})
 }
@@ -105,12 +105,6 @@ func (r GetReducerJobReply) wait() bool {
 }
 
 func (r GetReducerJobReply) run(reducef func(string, []string) string) {
-	timeout := time.NewTimer(10 * time.Second)
-	defer timeout.Stop()
-	go func() {
-		<-timeout.C
-		putReducerJob(PutReducerJobArgs{WorkerId: WorkerId, ReducerIndex: r.ReducerIndex, Success: false})
-	}()
 	output, err := os.Create(fmt.Sprintf("mr-out-%d", r.ReducerIndex))
 	if err != nil {
 		panic(err)
@@ -125,8 +119,15 @@ func (r GetReducerJobReply) run(reducef func(string, []string) string) {
 		panic(err)
 	}
 	sortedKeys := slices.Sorted(maps.Keys(m))
+	timeout := time.NewTimer(10 * time.Second)
 	for _, key := range sortedKeys {
-		fmt.Fprintf(output, "%v %v\n", key, reducef(key, m[key]))
+		select {
+		case <-timeout.C:
+			putReducerJob(PutReducerJobArgs{WorkerId: WorkerId, ReducerIndex: r.ReducerIndex, Success: false})
+			return
+		default:
+			fmt.Fprintf(output, "%v %v\n", key, reducef(key, m[key]))
+		}
 	}
 	putReducerJob(PutReducerJobArgs{WorkerId: WorkerId, ReducerIndex: r.ReducerIndex, Success: true})
 }

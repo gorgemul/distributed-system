@@ -2,9 +2,9 @@ package mr
 
 import (
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net/rpc"
-	"hash/fnv"
 	"os"
 	"time"
 )
@@ -37,11 +37,10 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 }
 
 func keepAlive() {
-	ticker := time.NewTicker(1 * time.Second)
 	go func() {
-		for {
-			<-ticker.C
-			// log.Printf("[CLIENT] worker %d ping server", WorkerId)
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
 			ping()
 		}
 	}()

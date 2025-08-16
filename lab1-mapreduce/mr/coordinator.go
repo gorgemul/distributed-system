@@ -1,43 +1,41 @@
 package mr
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
 	"net"
-	"os"
-	"net/rpc"
 	"net/http"
+	"net/rpc"
+	"os"
 	"sync"
-	"fmt"
-	"encoding/json"
 	"time"
 )
 
 type jobStatus int
 type workerType int
 type workerStatus struct {
-	kind workerType
-	mapperJobKey string
+	kind          workerType
+	mapperJobKey  string
 	reducerJobKey int
-	pingTime time.Time
+	pingTime      time.Time
 }
+
 type Coordinator struct {
-	// Your definitions here.
 	nReduce                 int
-
-	quit                    bool
 	quitLock                sync.Mutex
-
-	intermediateLocks       []sync.Mutex
-	intermediate            []map[string][]string
-
+	quit                    bool
+	workerIntermediateLock  sync.Mutex
+	workerIntermediate      map[int][]map[string][]string
+	intermediateLock        sync.Mutex
+	intermediate            [][]map[string][]string
 	jobLock                 sync.Mutex
 	mapperJobs              map[string]jobStatus
 	mapperJobsSuccessCount  int
 	reducerJobs             map[int]jobStatus
 	reducerJobsSuccessCount int
-
-	workerTrackerLock       sync.Mutex
-	workerTracker           map[int]workerStatus
+	checkerLock             sync.Mutex
+	checker                 map[int]workerStatus
 }
 
 const (
@@ -59,10 +57,10 @@ func (c *Coordinator) GetMapperJob(args *GetMapperJobArgs, reply *GetMapperJobRe
 		return nil
 	}
 	for file, status := range c.mapperJobs {
-		if status == Ready { 
-			c.workerTrackerLock.Lock()
-			c.workerTracker[args.WorkerId] = workerStatus{kind: Mapper, mapperJobKey: file, pingTime: time.Now()}
-			c.workerTrackerLock.Unlock()
+		if status == Ready {
+			c.checkerLock.Lock()
+			c.checker[args.WorkerId] = workerStatus{kind: Mapper, mapperJobKey: file, pingTime: time.Now()}
+			c.checkerLock.Unlock()
 			c.mapperJobs[file] = Exec
 			reply.File = file
 			reply.NReduce = c.nReduce
@@ -72,11 +70,18 @@ func (c *Coordinator) GetMapperJob(args *GetMapperJobArgs, reply *GetMapperJobRe
 	return nil
 }
 
-// TODO: handle partially emit
 func (c *Coordinator) MapperEmit(args *MapperEmitArgs, _ *RpcPlaceholder) error {
-	c.intermediateLocks[args.ReducerIndex].Lock()
-	defer c.intermediateLocks[args.ReducerIndex].Unlock()
-	c.intermediate[args.ReducerIndex][args.Key] = append(c.intermediate[args.ReducerIndex][args.Key], args.Values...)
+	c.workerIntermediateLock.Lock()
+	defer c.workerIntermediateLock.Unlock()
+	intermediate, ok := c.workerIntermediate[args.WorkerId]
+	if !ok {
+		c.workerIntermediate[args.WorkerId] = make([]map[string][]string, c.nReduce)
+		intermediate = c.workerIntermediate[args.WorkerId]
+		for i := range c.nReduce {
+			intermediate[i] = make(map[string][]string)
+		}
+	}
+	intermediate[args.ReducerIndex][args.Key] = append(intermediate[args.ReducerIndex][args.Key], args.Values...)
 	return nil
 }
 
@@ -86,28 +91,44 @@ func (c *Coordinator) PutMapperJob(args *PutMapperJobArgs, _ *RpcPlaceholder) er
 	if args.Success {
 		c.mapperJobs[args.File] = Success
 		c.mapperJobsSuccessCount++
+		c.intermediateLock.Lock()
+		c.workerIntermediateLock.Lock()
+		c.intermediate = append(c.intermediate, c.workerIntermediate[args.WorkerId])
+		delete(c.workerIntermediate, args.WorkerId)
+		c.workerIntermediateLock.Unlock()
 		if c.mapperJobsSuccessCount == len(c.mapperJobs) {
-			//TODO: should have a [WorkerId][ReducerIndex]{k, values}, and aggregate it to c.intermediate[i]
+			intermediate := make([]map[string][]string, c.nReduce)
 			for i := range c.nReduce {
-				f, err := os.Create(fmt.Sprintf("mr-intermediate-%d.json", i))
-				if err != nil {
-					panic(err)
-				}
-				data, err := json.Marshal(c.intermediate[i])
-				if err != nil {
-					panic(err)
-				}
-				f.Write(data)
-				f.Close()
+				intermediate[i] = make(map[string][]string)
 			}
+			for _, item := range c.intermediate {
+				for i, m := range item {
+					for k, vs := range m {
+						intermediate[i][k] = append(intermediate[i][k], vs...)
+					}
+				}
+			}
+			for i := range c.nReduce {
+				data, err := json.Marshal(intermediate[i])
+				if err != nil {
+					panic(err)
+				}
+				if err = os.WriteFile(fmt.Sprintf("mr-intermediate-%d.json", i), data, 0644); err != nil {
+					panic(err)
+				}
+			}
+			c.intermediate = nil
 		}
+		c.intermediateLock.Unlock()
 	} else {
 		c.mapperJobs[args.File] = Ready
+		c.workerIntermediateLock.Lock()
+		delete(c.workerIntermediate, args.WorkerId)
+		c.workerIntermediateLock.Unlock()
 	}
-	c.workerTrackerLock.Lock()
-	// log.Printf("[SERVER]: mapper remove worker %d from tracker", args.WorkerId)
-	delete(c.workerTracker, args.WorkerId)
-	c.workerTrackerLock.Unlock()
+	c.checkerLock.Lock()
+	delete(c.checker, args.WorkerId)
+	c.checkerLock.Unlock()
 	return nil
 }
 
@@ -120,10 +141,9 @@ func (c *Coordinator) GetReducerJob(args *GetReducerJobArgs, reply *GetReducerJo
 	}
 	for i, status := range c.reducerJobs {
 		if status == Ready {
-			c.workerTrackerLock.Lock()
-			// log.Printf("assign reducer %d to worker %d", i, args.WorkerId)
-			c.workerTracker[args.WorkerId] = workerStatus{kind: Reducer, reducerJobKey: i, pingTime: time.Now()}
-			c.workerTrackerLock.Unlock()
+			c.checkerLock.Lock()
+			c.checker[args.WorkerId] = workerStatus{kind: Reducer, reducerJobKey: i, pingTime: time.Now()}
+			c.checkerLock.Unlock()
 			c.reducerJobs[i] = Exec
 			reply.ReducerIndex = i
 			break
@@ -146,35 +166,32 @@ func (c *Coordinator) PutReducerJob(args *PutReducerJobArgs, _ *RpcPlaceholder) 
 	} else {
 		c.reducerJobs[args.ReducerIndex] = Ready
 	}
-	c.workerTrackerLock.Lock()
-	// log.Printf("[SERVER]: reducer remove worker %d from tracker", args.WorkerId)
-	delete(c.workerTracker, args.WorkerId)
-	c.workerTrackerLock.Unlock()
+	c.checkerLock.Lock()
+	delete(c.checker, args.WorkerId)
+	c.checkerLock.Unlock()
 	return nil
 }
 
 func (c *Coordinator) KeepAlive(args *KeepAliveArgs, _ *RpcPlaceholder) error {
-	c.workerTrackerLock.Lock()
-	defer c.workerTrackerLock.Unlock()
-	ws, ok := c.workerTracker[args.WorkerId]
-	// log.Printf("[SERVER] receive client %d ping", args.WorkerId)
+	c.checkerLock.Lock()
+	defer c.checkerLock.Unlock()
+	worker, ok := c.checker[args.WorkerId]
 	// indicating that worker hasn't getting any job yet
-	if !ok { 
-		// log.Printf("[SERVER] client %d not has job yet", args.WorkerId)
+	if !ok {
 		return nil
 	}
-	ws.pingTime = time.Now()
-	c.workerTracker[args.WorkerId] = ws
+	worker.pingTime = time.Now()
+	c.checker[args.WorkerId] = worker
 	return nil
 }
 
-func (c *Coordinator) trackWorkers() {
-	ticker := time.NewTicker(3 * time.Second)
+func (c *Coordinator) check() {
 	go func() {
-		for {
-			<-ticker.C
-			c.workerTrackerLock.Lock()
-			for id, status := range c.workerTracker {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			c.checkerLock.Lock()
+			for id, status := range c.checker {
 				if time.Since(status.pingTime).Seconds() >= 3 {
 					c.jobLock.Lock()
 					switch status.kind {
@@ -184,20 +201,20 @@ func (c *Coordinator) trackWorkers() {
 						c.reducerJobs[status.reducerJobKey] = Ready
 					}
 					c.jobLock.Unlock()
-					// log.Printf("worker %v is being deleted", id)
-					delete(c.workerTracker, id)
+					c.workerIntermediateLock.Lock()
+					delete(c.workerIntermediate, id)
+					c.workerIntermediateLock.Unlock()
+					delete(c.checker, id)
 				}
 			}
-			c.workerTrackerLock.Unlock()
+			c.checkerLock.Unlock()
 		}
 	}()
 }
 
-// start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
 	sockname := coordinatorSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
@@ -207,40 +224,27 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-// main/mrcoordinator.go calls Done() periodically to find out
-// if the entire job has finished.
 func (c *Coordinator) Done() bool {
 	c.quitLock.Lock()
-	q := c.quit
-	c.quitLock.Unlock()
-	return q
+	defer c.quitLock.Unlock()
+	return c.quit
 }
 
-// create a Coordinator.
-// main/mrcoordinator.go calls this function.
-// nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-	// Your code here.
-	mapperJobs := make(map[string]jobStatus)
-	reducerJobs := make(map[int]jobStatus)
-	intermediate := make([]map[string][]string, nReduce)
+	c := &Coordinator{
+		nReduce:            nReduce,
+		mapperJobs:         make(map[string]jobStatus),
+		reducerJobs:        make(map[int]jobStatus),
+		workerIntermediate: make(map[int][]map[string][]string),
+		checker:            make(map[int]workerStatus),
+	}
 	for _, file := range files {
-		mapperJobs[file] = Ready
+		c.mapperJobs[file] = Ready
 	}
 	for i := range nReduce {
-		reducerJobs[i] = Ready
+		c.reducerJobs[i] = Ready
 	}
-	for i := range intermediate {
-		intermediate[i] = make(map[string][]string)
-	}
-	c.nReduce = nReduce
-	c.mapperJobs = mapperJobs
-	c.reducerJobs = reducerJobs
-	c.intermediateLocks = make([]sync.Mutex, nReduce)
-	c.intermediate = intermediate
-	c.workerTracker = make(map[int]workerStatus)
 	c.server()
-	c.trackWorkers()
-	return &c
+	c.check()
+	return c
 }
