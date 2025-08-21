@@ -2,7 +2,6 @@ package lock
 
 import (
 	"fmt"
-	//	"log"
 	"strconv"
 	"testing"
 	"time"
@@ -51,8 +50,6 @@ func oneClient(t *testing.T, me int, ck kvtest.IKVClerk, done chan struct{}) kvt
 			if !(err == rpc.OK || err == rpc.ErrMaybe) {
 				t.Fatalf("%d: put failed %v", me, err)
 			}
-
-			// log.Printf("%d: release lock", me)
 
 			lk.Release()
 		}

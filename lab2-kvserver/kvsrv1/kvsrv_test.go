@@ -1,7 +1,6 @@
 package kvsrv
 
 import (
-	// "log"
 	"runtime"
 	"testing"
 	"time"
