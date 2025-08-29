@@ -8,13 +8,13 @@ package raft
 
 import (
 	//	"bytes"
+	"fmt"
 	"maps"
 	"math/rand"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
-	"fmt"
 
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -51,11 +51,10 @@ type Raft struct {
 	// You data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	electionTime       time.Time
-	endHeartbeatTicker chan bool
-	currentTerm        int
-	state              state
-	votedFor           *int
+	electionTime time.Time
+	currentTerm  int
+	state        state
+	votedFor     *int
 	// TODO: maybe change to map[int]logEntry
 	logs        map[int]any
 	commitIndex int
@@ -165,26 +164,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintln1(who{follower, rf.me, rf.currentTerm}, RECV, who{candidate, args.CandidateId,args.CandidateTerm}, "RequestVote")
+	DPrintln1(who{follower, rf.me, rf.currentTerm}, RECV, who{candidate, args.CandidateId, args.CandidateTerm}, "RequestVote")
 	reply.FollowerTerm = rf.currentTerm
 	if rf.currentTerm > args.CandidateTerm {
 		reply.VoteGranted = false
 		return
 	}
 	if args.CandidateTerm > rf.currentTerm {
-		if rf.state == leader {
-			rf.endHeartbeatTicker <- true
-			rf.state = follower
-			rf.electionTime = time.Now()
-		}
-		rf.votedFor = nil
-		rf.currentTerm = args.CandidateTerm
+		rf.convertToFollower(args.CandidateTerm)
 	}
 	lastLogIndex, lastLogTerm := rf.latestLog()
 	candidateLogUpToDate := log1MoreUpToDate(args.LastLogIndex, args.LastLogTerm, lastLogIndex, lastLogTerm)
 	if (rf.votedFor == nil || *rf.votedFor == args.CandidateId) && candidateLogUpToDate {
-		DPrintln1(who{follower, rf.me, rf.currentTerm}, REPLY, who{candidate, args.CandidateId,args.CandidateTerm}, "RequestVote")
+		DPrintln1(who{follower, rf.me, rf.currentTerm}, REPLY, who{candidate, args.CandidateId, args.CandidateTerm}, "RequestVote")
 		rf.votedFor = &args.CandidateId
+		rf.electionTime = time.Now()
 		reply.VoteGranted = true
 		return
 	}
@@ -200,19 +194,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	rf.electionTime = time.Now()
-	rf.votedFor = nil
-	if args.LeaderTerm >= rf.currentTerm {
-		if rf.state == candidate {
-			DPrintln2(who{candidate, rf.me, rf.currentTerm}, "step down from AppendEntries")
-			rf.state = follower
-			rf.votedFor = nil
+	switch rf.state {
+	case follower:
+		if args.LeaderTerm > rf.currentTerm {
+			rf.currentTerm = args.LeaderTerm
 		}
-		if rf.state == leader && args.LeaderTerm > rf.currentTerm {
+	case leader:
+		if args.LeaderTerm > rf.currentTerm {
 			DPrintln2(who{leader, rf.me, rf.currentTerm}, "step down from AppendEntries")
-			rf.endHeartbeatTicker <- true
-			rf.state = follower
+			rf.convertToFollower(args.LeaderTerm)
 		}
-		rf.currentTerm = args.LeaderTerm
+	case candidate:
+		if args.LeaderTerm >= rf.currentTerm {
+			DPrintln2(who{candidate, rf.me, rf.currentTerm}, "step down from AppendEntries")
+			rf.convertToFollower(args.LeaderTerm)
+		}
 	}
 	_, lastLogTerm := rf.latestLog()
 	_, ok := rf.logs[args.PrevLogIndex]
@@ -313,89 +309,91 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		ms := 50 + (rand.Int63() % 300)
+		ms := (HeartbeatMinTimeMs + 10) + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		// Your code here (3A)
 		// Check if a leader election should be started.
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		rf.mu.Lock()
-		electionTimeout := time.Since(rf.electionTime) >= electionTime()
-		firstElection := rf.state == follower && rf.votedFor == nil
-		reElection := rf.state == candidate && (rf.votedFor != nil && *rf.votedFor == rf.me)
+		timeoutDuration := time.Duration(ElectionMinTimeMs+(rand.Int63()%200)) * time.Millisecond
+		electionTimeout := time.Since(rf.electionTime) >= timeoutDuration
+		isLeader := rf.state == leader
 		rf.mu.Unlock()
-		if electionTimeout && (firstElection || reElection) {
-			rf.launchElection()
-		}
-	}
-}
-
-func (rf *Raft) launchElection() {
-	var wg sync.WaitGroup
-	var votes int64
-	rf.mu.Lock()
-	rf.currentTerm += 1
-	rf.state = candidate
-	rf.votedFor = &rf.me
-	atomic.AddInt64(&votes, 1)
-	rf.mu.Unlock()
-	DPrintln2(who{candidate, rf.me, rf.currentTerm}, "launch election")
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		wg.Add(1)
-		go func(peer int) {
-			defer wg.Done()
+		if electionTimeout && !isLeader {
+			var wg sync.WaitGroup
+			var votes int64
 			rf.mu.Lock()
-			if rf.state != candidate {
-				rf.mu.Unlock()
-				return
-			}
-			lastLogIndex, lastLogTerm := rf.latestLog()
-			args := RequestVoteArgs{
-				CandidateTerm: rf.currentTerm,
-				CandidateId:   rf.me,
-				LastLogIndex:  lastLogIndex,
-				LastLogTerm:   lastLogTerm,
-			}
-			var reply RequestVoteReply
+			rf.currentTerm += 1
+			rf.state = candidate
+			rf.votedFor = &rf.me
+			atomic.AddInt64(&votes, 1)
+			DPrintln2(who{candidate, rf.me, rf.currentTerm}, "launch election")
 			rf.mu.Unlock()
-			DPrintln1(who{candidate, rf.me, rf.currentTerm}, SEND, who{follower, peer, NO_TERM}, "RequestVote")
-			done := make(chan bool)
-			go func() {
-				ok := rf.sendRequestVote(peer, &args, &reply)
-				if ok {
-					if reply.VoteGranted {
-						atomic.AddInt64(&votes, 1)
-					}
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+				wg.Add(1)
+				go func(peer int) {
+					defer wg.Done()
 					rf.mu.Lock()
-					if reply.FollowerTerm > rf.currentTerm {
-						rf.currentTerm = reply.FollowerTerm
-						rf.state = follower
-						rf.votedFor = nil
-						rf.electionTime = time.Now()
+					if rf.state != candidate {
+						rf.mu.Unlock()
+						return
 					}
 					rf.mu.Unlock()
-				}
-				done <- true
-			}()
-			select {
-			case <-done:
-				return
-			case <-time.After((ElectionMinTimeMs - 100) * time.Millisecond):
-				return
+					done := make(chan bool)
+					go func() {
+						rf.mu.Lock()
+						if rf.state != candidate {
+							done <- true
+							rf.mu.Unlock()
+							return
+						}
+						lastLogIndex, lastLogTerm := rf.latestLog()
+						args := RequestVoteArgs{
+							CandidateTerm: rf.currentTerm,
+							CandidateId:   rf.me,
+							LastLogIndex:  lastLogIndex,
+							LastLogTerm:   lastLogTerm,
+						}
+						var reply RequestVoteReply
+						DPrintln1(who{candidate, rf.me, rf.currentTerm}, SEND, who{follower, peer, NO_TERM}, "RequestVote")
+						rf.mu.Unlock()
+						ok := rf.sendRequestVote(peer, &args, &reply)
+						if ok {
+							rf.mu.Lock()
+							if reply.VoteGranted {
+								atomic.AddInt64(&votes, 1)
+							}
+							if reply.FollowerTerm > rf.currentTerm {
+								DPrintln2(who{candidate, rf.me, rf.currentTerm}, "step down from launchElection")
+								rf.convertToFollower(reply.FollowerTerm)
+							}
+							rf.mu.Unlock()
+						}
+						done <- true
+					}()
+					select {
+					case <-done:
+						return
+					case <-time.After((ElectionMinTimeMs - 100) * time.Millisecond):
+						return
+					}
+				}(i)
 			}
-		}(i)
-	}
-	wg.Wait()
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.state == candidate && votes >= rf.majority() {
-		DPrintln2(who{candidate, rf.me, rf.currentTerm}, fmt.Sprintf("Getting %d votes, become leader", votes))
-		rf.state = leader
-		rf.votedFor = nil
-		go rf.broadcastHeartbeatTicker()
+			wg.Wait()
+			rf.mu.Lock()
+			majority := int64((len(rf.peers) + 1) / 2)
+			if rf.state == candidate && votes >= majority {
+				DPrintln2(who{candidate, rf.me, rf.currentTerm}, fmt.Sprintf("Getting %d votes, become leader", votes))
+				rf.state = leader
+				rf.votedFor = nil
+				go rf.startBroadcastHeartbeatTicker()
+			}
+			rf.mu.Unlock()
+		}
 	}
 }
 
@@ -410,17 +408,21 @@ func (rf *Raft) latestLog() (index, term int) {
 	return
 }
 
-func (rf *Raft) majority() int64 {
-	return int64((len(rf.peers) + 1) / 2)
+// caller must hold rf.mu
+func (rf *Raft) convertToFollower(newTerm int) {
+	rf.votedFor = nil
+	rf.state = follower
+	rf.currentTerm = newTerm
+	rf.electionTime = time.Now()
 }
 
 func (rf *Raft) broadcastHeartbeat() {
 	rf.mu.Lock()
-	isLeader := rf.state == leader
-	rf.mu.Unlock()
-	if !isLeader {
+	if rf.state != leader {
+		rf.mu.Unlock()
 		return
 	}
+	rf.mu.Unlock()
 	var wg sync.WaitGroup
 	for i := range rf.peers {
 		if i == rf.me {
@@ -434,31 +436,35 @@ func (rf *Raft) broadcastHeartbeat() {
 				rf.mu.Unlock()
 				return
 			}
-			prevLogIndex, prevLogTerm := rf.latestLog()
-			args := AppendEntriesArgs{
-				LeaderTerm:   rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      make(map[int]any),
-				LeaderCommit: rf.commitIndex,
-			}
-			var reply AppendEntriesReply
 			rf.mu.Unlock()
-			DPrintln1(who{leader, rf.me, rf.currentTerm}, SEND, who{follower, peer, NO_TERM}, "heartbeat")
 			done := make(chan bool)
 			go func() {
+				rf.mu.Lock()
+				if rf.state != leader {
+					done <- true
+					rf.mu.Unlock()
+					return
+				}
+				prevLogIndex, prevLogTerm := rf.latestLog()
+				args := AppendEntriesArgs{
+					LeaderTerm:   rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm:  prevLogTerm,
+					Entries:      make(map[int]any),
+					LeaderCommit: rf.commitIndex,
+				}
+				var reply AppendEntriesReply
+				DPrintln1(who{leader, rf.me, rf.currentTerm}, SEND, who{follower, peer, NO_TERM}, "heartbeat")
+				rf.mu.Unlock()
 				ok := rf.sendAppendEntries(peer, &args, &reply)
 				rf.mu.Lock()
-				if ok && reply.FollowerTerm > rf.currentTerm {
+				if ok && rf.state == leader && reply.FollowerTerm > rf.currentTerm {
 					DPrintln2(who{leader, rf.me, rf.currentTerm}, "step down from heartbeat")
-					rf.endHeartbeatTicker <- true
-					rf.state = follower
-					rf.electionTime = time.Now()
-					rf.currentTerm = reply.FollowerTerm
+					rf.convertToFollower(reply.FollowerTerm)
 				}
 				rf.mu.Unlock()
-				done<-true
+				done <- true
 			}()
 			select {
 			case <-done:
@@ -471,15 +477,16 @@ func (rf *Raft) broadcastHeartbeat() {
 	wg.Wait()
 }
 
-func (rf *Raft) broadcastHeartbeatTicker() {
+func (rf *Raft) startBroadcastHeartbeatTicker() {
 	for {
-		select {
-		case <-rf.endHeartbeatTicker:
+		rf.mu.Lock()
+		if rf.state != leader {
+			rf.mu.Unlock()
 			return
-		default:
-			rf.broadcastHeartbeat()
-			time.Sleep(HeartbeatMinTimeMs * time.Millisecond)
 		}
+		rf.mu.Unlock()
+		rf.broadcastHeartbeat()
+		time.Sleep(HeartbeatMinTimeMs * time.Millisecond)
 	}
 }
 
@@ -500,7 +507,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
-	rf.endHeartbeatTicker = make(chan bool)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -519,9 +525,4 @@ func log1MoreUpToDate(log1Index, log1Term, log2Index, log2Term int) bool {
 		return true
 	}
 	return log1Index >= log2Index
-}
-
-// 600 - 800 ms
-func electionTime() time.Duration {
-	return time.Duration(ElectionMinTimeMs+(rand.Int63()%200)) * time.Millisecond
 }
